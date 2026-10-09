@@ -126,6 +126,13 @@ service fastbootd /system/bin/fastbootd
     seclabel u:r:fastbootd:s0
     user root
 
+# Recovery UI must not create read-only properties or control adbd directly.
+# This explicit menu request is recovery-only; init performs the privileged work.
+on property:sys.usb.config.recovery_adb=requested
+    setprop ro.adb.secure.recovery 0
+    restart adbd
+    setprop sys.usb.config.recovery_adb enabled
+
 # Restart adbd so it can run as root
 on property:service.adb.root=1
     restart adbd
