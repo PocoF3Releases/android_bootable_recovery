@@ -677,6 +677,20 @@ bool MinuiBackendDrmQti::FindAndSetMonitor(int fd, drmModeRes* resources) {
         break;
       }
     }
+
+    const int refresh_rate =
+        android::base::GetIntProperty("ro.recovery.ui.refresh_rate", 0);
+    const auto& preferred = drmConnectors[drm_index]->modes[drm[drm_index].selected_mode];
+    for (int mode = 0; refresh_rate > 0 && mode < drmConnectors[drm_index]->count_modes;
+         ++mode) {
+      const auto& candidate = drmConnectors[drm_index]->modes[mode];
+      if (candidate.hdisplay == preferred.hdisplay &&
+          candidate.vdisplay == preferred.vdisplay && candidate.vrefresh == refresh_rate) {
+        drm[drm_index].selected_mode = mode;
+        printf("Choosing requested display mode #%d @ %d Hz\n", mode, refresh_rate);
+        break;
+      }
+    }
   }
 
   return drmConnectors.size() > 0;

@@ -32,6 +32,7 @@
 #include <drm_fourcc.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
+#include <android-base/properties.h>
 
 #include "minui/minui.h"
 
@@ -313,6 +314,20 @@ bool MinuiBackendDrm::FindAndSetMonitor(int fd, drmModeRes* resources) {
       if (drmConnectors[drm_index]->modes[modes].type & DRM_MODE_TYPE_PREFERRED) {
         printf("Choosing display mode #%d\n", modes);
         drm[drm_index].selected_mode = modes;
+        break;
+      }
+    }
+
+    const int refresh_rate =
+        android::base::GetIntProperty("ro.recovery.ui.refresh_rate", 0);
+    const auto& preferred = drmConnectors[drm_index]->modes[drm[drm_index].selected_mode];
+    for (int mode = 0; refresh_rate > 0 && mode < drmConnectors[drm_index]->count_modes;
+         ++mode) {
+      const auto& candidate = drmConnectors[drm_index]->modes[mode];
+      if (candidate.hdisplay == preferred.hdisplay &&
+          candidate.vdisplay == preferred.vdisplay && candidate.vrefresh == refresh_rate) {
+        drm[drm_index].selected_mode = mode;
+        printf("Choosing requested display mode #%d @ %d Hz\n", mode, refresh_rate);
         break;
       }
     }
