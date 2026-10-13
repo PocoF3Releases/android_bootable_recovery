@@ -269,6 +269,9 @@ phony {
     name: "recovery_deps",
     recovery: true,
     required: [
+        "recovery-storage",
+        "bzip2.recovery",
+        "mount.ntfs.recovery",
         "e2fsck.recovery",
         "resize2fs.recovery",
         "tune2fs.recovery",

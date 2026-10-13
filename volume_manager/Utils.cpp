@@ -53,11 +53,6 @@ using namespace std::chrono_literals;
 namespace android {
 namespace volmgr {
 
-char* sBlkidContext = nullptr;
-char* sBlkidUntrustedContext = nullptr;
-char* sFsckContext = nullptr;
-char* sFsckUntrustedContext = nullptr;
-
 #include <blkid/blkid.h>
 
 static const char* kProcFilesystems = "/proc/filesystems";
@@ -223,13 +218,10 @@ status_t ReadMetadataUntrusted(const std::string& path, std::string& fsType, std
 }
 
 status_t ForkExecvp(const std::vector<std::string>& args) {
-    return ForkExecvp(args, nullptr);
-}
-
-status_t ForkExecvp(const std::vector<std::string>& args, char* context) {
-    std::vector<std::string> output;
+    if (args.empty()) return -EINVAL;
     size_t argc = args.size();
     char** argv = (char**)calloc(argc + 1, sizeof(char*));
+    if (!argv) return -ENOMEM;
     for (size_t i = 0; i < argc; i++) {
         argv[i] = (char*)args[i].c_str();
         if (i == 0) {
@@ -239,17 +231,14 @@ status_t ForkExecvp(const std::vector<std::string>& args, char* context) {
         }
     }
 
-    if (setexeccon(context)) {
-        LOG(ERROR) << "Failed to setexeccon";
-        abort();
-    }
-
     pid_t pid = fork();
     int fork_errno = errno;
     if (pid == 0) {
-        close(STDIN_FILENO);
-        close(STDOUT_FILENO);
-        close(STDERR_FILENO);
+        // Keep diagnostics in recovery's log and reserve standard input so
+        // libraries in the child never acquire descriptors 0, 1 or 2.
+        const int null_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        if (null_fd < 0 || dup2(null_fd, STDIN_FILENO) == -1) _exit(1);
+        if (null_fd != STDIN_FILENO) close(null_fd);
 
         if (execvp(argv[0], argv)) {
             PLOG(ERROR) << "Failed to exec";
@@ -258,19 +247,21 @@ status_t ForkExecvp(const std::vector<std::string>& args, char* context) {
         _exit(1);
     }
 
-    if (setexeccon(nullptr)) {
-        LOG(ERROR) << "Failed to setexeccon";
-        abort();
-    }
-
     if (pid == -1) {
-        PLOG(ERROR) << "Failed to exec";
+        free(argv);
+        PLOG(ERROR) << "Failed to fork";
         return -fork_errno;
     }
 
-    waitpid(pid, nullptr, 0);
-
+    int status = 0;
+    const auto waited = TEMP_FAILURE_RETRY(waitpid(pid, &status, 0));
+    const int wait_errno = errno;
     free(argv);
+    if (waited == -1) return -wait_errno;
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        LOG(ERROR) << args[0] << " failed with process status " << status;
+        return -EIO;
+    }
     return OK;
 }
 

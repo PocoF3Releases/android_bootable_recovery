@@ -49,6 +49,7 @@ class EmulatedVolume : public VolumeBase {
     status_t doUnmount(bool detach = false) override;
 
   private:
+    bool mEncrypted;
     std::string mSubdir;
     std::string mDevPath;
     std::string mFsType;

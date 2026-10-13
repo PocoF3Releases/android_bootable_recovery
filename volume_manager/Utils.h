@@ -39,12 +39,6 @@ struct DIR;
 namespace android {
 namespace volmgr {
 
-/* SELinux contexts used depending on the block device type */
-extern char* sBlkidContext;
-extern char* sBlkidUntrustedContext;
-extern char* sFsckContext;
-extern char* sFsckUntrustedContext;
-
 status_t CreateDeviceNode(const std::string& path, dev_t dev);
 status_t DestroyDeviceNode(const std::string& path);
 
@@ -68,9 +62,8 @@ status_t ReadMetadata(const std::string& path, std::string& fsType, std::string&
 status_t ReadMetadataUntrusted(const std::string& path, std::string& fsType, std::string& fsUuid,
                                std::string& fsLabel);
 
-/* Returns either WEXITSTATUS() status, or a negative errno */
+/* Returns OK on success, or a negative errno on launch or child failure. */
 status_t ForkExecvp(const std::vector<std::string>& args);
-status_t ForkExecvp(const std::vector<std::string>& args, char* context);
 
 bool IsFilesystemSupported(const std::string& fsType);
 

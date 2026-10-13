@@ -107,6 +107,7 @@ cc_library_static {
     srcs: [
         "adb_install.cpp",
         "fuse_install.cpp",
+        "raw_install.cpp",
         "virtiofs_install.cpp",
         "install.cpp",
         "snapshot_utils.cpp",
@@ -116,6 +117,7 @@ cc_library_static {
     ],
 
     header_libs: [
+        "bootimg_headers",
         "libminadbd_headers",
         "libupdate_engine_headers",
     ],

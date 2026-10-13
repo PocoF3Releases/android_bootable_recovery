@@ -45,6 +45,7 @@ static const std::string kFbeKeyVersion = kStagingPath + "/unencrypted/key/versi
 
 EmulatedVolume::EmulatedVolume(FstabEntry* rec, const std::string& subdir)
     : VolumeBase(Type::kEmulated),
+      mEncrypted(!rec->encryption_options.empty() || !rec->metadata_encryption_options.empty()),
       mSubdir(subdir),
       mDevPath(rec->blk_device),
       mFsType(rec->fs_type),
@@ -58,7 +59,7 @@ EmulatedVolume::EmulatedVolume(FstabEntry* rec, const std::string& subdir)
 EmulatedVolume::~EmulatedVolume() {}
 
 status_t EmulatedVolume::doMount() {
-    if (fs_prepare_dir(kStagingPath.c_str(), 0700, AID_ROOT, AID_ROOT)) {
+    if (!mEncrypted && fs_prepare_dir(kStagingPath.c_str(), 0700, AID_ROOT, AID_ROOT)) {
         PLOG(ERROR) << getId() << " failed to create mount points";
         return -errno;
     }
@@ -67,6 +68,14 @@ status_t EmulatedVolume::doMount() {
         return -errno;
     }
 
+    if (mEncrypted) {
+        const auto unlocked = ForkExecvp({"/system/bin/recovery-storage"});
+        // Also clean up when the helper timed out or was terminated by a signal.
+        const auto cleaned = ForkExecvp({"/system/bin/recovery-storage", "--cleanup"});
+        if (unlocked != OK || cleaned != OK ||
+            BindMount("/data/" + mSubdir, getPath()) != OK) return -EIO;
+        return OK;
+    }
     std::string bindPath = kStagingPath + "/" + mSubdir;
 
     if (::mount(mDevPath.c_str(), kStagingPath.c_str(), mFsType.c_str(), mFlags,
@@ -86,7 +95,7 @@ status_t EmulatedVolume::doMount() {
 
 status_t EmulatedVolume::doUnmount(bool detach /* = false */) {
     ForceUnmount(getPath(), detach);
-    ForceUnmount(kStagingPath, detach);
+    if (!mEncrypted) ForceUnmount(kStagingPath, detach);
 
     rmdir(getPath().c_str());
     rmdir(kStagingPath.c_str());
@@ -95,10 +104,12 @@ status_t EmulatedVolume::doUnmount(bool detach /* = false */) {
 }
 
 bool EmulatedVolume::detectMountable() {
+    // Probe capability only. Do not access keys during recovery startup.
+    if (mEncrypted) return access("/system/bin/recovery-storage", X_OK) == 0;
     bool mountable = false;
     if (doMount() == OK) {
         // Check if FBE encrypted
-        mountable = access(kFbeKeyVersion.c_str(), F_OK) != 0;
+        mountable = mEncrypted || access(kFbeKeyVersion.c_str(), F_OK) != 0;
         doUnmount();
     }
     return mountable;

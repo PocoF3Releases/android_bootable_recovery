@@ -32,12 +32,15 @@
 #include <vector>
 
 #include <android-base/logging.h>
+#include <android-base/scopeguard.h>
 #include <android-base/strings.h>
 
 #include "bootloader_message/bootloader_message.h"
 #include "fuse_provider.h"
 #include "fuse_sideload.h"
 #include "install/install.h"
+#include "install/raw_install.h"
+#include "install/snapshot_utils.h"
 #include "recovery_utils/roots.h"
 
 namespace fs = std::filesystem;
@@ -69,20 +72,29 @@ std::string BrowseDirectory(const std::string& path, Device* device, RecoveryUI*
   std::vector<std::string> dirs;
   std::vector<std::string> entries{ "../" };  // "../" is always the first entry.
 
-  for (const auto& entry : fs::directory_iterator(path)) {
+  std::error_code error;
+  fs::directory_iterator iterator(path, error), end;
+  for (; !error && iterator != end; iterator.increment(error)) {
+    const auto& entry = *iterator;
     std::string name = entry.path().filename().string();
 
     // Skip "." and ".." entries.
     if (name == "." || name == "..") continue;
 
-    if (entry.is_directory()) {
+    if (entry.is_directory(error)) {
       dirs.push_back(name + "/");
-    } else if (entry.is_regular_file()) {
+    } else if (!error && entry.is_regular_file(error)) {
       if (android::base::EndsWithIgnoreCase(name, ".zip") ||
-          android::base::EndsWithIgnoreCase(name, ".map")) {
+          android::base::EndsWithIgnoreCase(name, ".map") ||
+          android::base::EndsWithIgnoreCase(name, ".img")) {
         entries.push_back(name);
       }
     }
+  }
+
+  if (error) {
+    ui->Print("Unable to read storage: %s\n", error.message().c_str());
+    return "";
   }
 
   std::sort(dirs.begin(), dirs.end());
@@ -91,7 +103,7 @@ std::string BrowseDirectory(const std::string& path, Device* device, RecoveryUI*
   // Append dirs to the entries list.
   entries.insert(entries.end(), dirs.begin(), dirs.end());
 
-  std::vector<std::string> headers{ "Choose a package to install:", path };
+  std::vector<std::string> headers{ "Choose a ZIP or image to install:", path };
 
   size_t chosen_item = 0;
   while (true) {
@@ -111,6 +123,7 @@ std::string BrowseDirectory(const std::string& path, Device* device, RecoveryUI*
       return "";
     }
 
+    if (chosen_item >= entries.size()) return "";
     const std::string& item = entries[chosen_item];
 
     std::string new_path = path + "/" + item;
@@ -120,7 +133,7 @@ std::string BrowseDirectory(const std::string& path, Device* device, RecoveryUI*
       std::string result = BrowseDirectory(new_path, device, ui);
       if (!result.empty()) return result;
     } else {
-      // Selected a zip file: return the path to the caller.
+      // Selected a package or image: return the path to the caller.
       return new_path;
     }
   }
@@ -208,12 +221,54 @@ InstallResult InstallWithFuseFromPath(std::string_view path, Device* device) {
 
 InstallResult ApplyFromStorage(Device* device, VolumeInfo& vi) {
   auto ui = device->GetUI();
-  if (!VolumeManager::Instance()->volumeMount(vi.mId)) {
+  const auto* data_volume = volume_for_mount_point("/data");
+  const bool needs_crypto = vi.mId == "emulated" && data_volume &&
+      !data_volume->metadata_encryption_options.empty();
+  const auto release_dependencies = [&]() {
+    bool success = true;
+    if (needs_crypto) {
+      // Child mounts must be released before their parent. Installed filesystem
+      // keys remain in the kernel; browsing no longer needs the crypto HALs.
+      for (const char* mount : {"/vendor/firmware_mnt", "/mnt/vendor/persist", "/odm", "/vendor"}) {
+        if (volume_for_mount_point(mount) && ensure_path_unmounted(mount) != 0) {
+          LOG(ERROR) << "Unable to release storage dependency: " << mount;
+          success = false;
+        }
+      }
+    }
+    return success;
+  };
+  auto dependency_cleanup = android::base::make_scope_guard(release_dependencies);
+  if (needs_crypto) {
+    if (!CreateSnapshotPartitions()) {
+      ui->Print("Unable to prepare encrypted storage.\n");
+      return INSTALL_ERROR;
+    }
+    map_logical_partitions();
+    // Snapshot preparation owns a temporary metadata mount and releases it.
+    // Mount it afterward so the storage helper can read the existing keys.
+    if (ensure_path_mounted("/metadata") != 0) {
+      ui->Print("Unable to mount encryption metadata.\n");
+      return INSTALL_ERROR;
+    }
+    for (const char* mount : {"/vendor", "/odm", "/vendor/firmware_mnt", "/mnt/vendor/persist"}) {
+      if (volume_for_mount_point(mount) && ensure_path_mounted(mount) != 0) {
+        ui->Print("Unable to mount storage dependency: %s\n", mount);
+        return INSTALL_ERROR;
+      }
+    }
+  }
+  const bool mounted = VolumeManager::Instance()->volumeMount(vi.mId);
+  const bool released = release_dependencies();
+  dependency_cleanup.Disable();
+  if (!mounted || !released) {
+    if (mounted) VolumeManager::Instance()->volumeUnmount(vi.mId);
+    ui->Print("Storage is locked or unavailable.\n");
     return INSTALL_NONE;
   }
 
   std::string path = BrowseDirectory(vi.mPath, device, ui);
-  if (path.empty()) {
+  if (path.empty() || path == "@") {
     VolumeManager::Instance()->volumeUnmount(vi.mId);
     return INSTALL_NONE;
   }
@@ -226,7 +281,8 @@ InstallResult ApplyFromStorage(Device* device, VolumeInfo& vi) {
   ui->Print("\n-- Install %s ...\n", path.c_str());
   SetSdcardUpdateBootloaderMessage();
 
-  auto result = InstallWithFuseFromPath(path, device);
+  auto result = android::base::EndsWithIgnoreCase(path, ".img")
+      ? InstallRawImage(path, device) : InstallWithFuseFromPath(path, device);
 
   VolumeManager::Instance()->volumeUnmount(vi.mId);
   return result;
