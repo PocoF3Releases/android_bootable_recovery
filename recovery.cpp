@@ -26,6 +26,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <functional>
 #include <iterator>
 #include <memory>
@@ -696,11 +697,19 @@ change_menu:
         break;
 
       case Device::ENABLE_ADB:
-        android::base::SetProperty("ro.adb.secure.recovery", "0");
-        android::base::SetProperty("ctl.restart", "adbd");
+        // Init owns read-only property creation and adbd service control. Recovery
+        // can request this action through the existing USB configuration property.
+        if (!android::base::SetProperty("sys.usb.config.recovery_adb", "requested") ||
+            !android::base::WaitForProperty("sys.usb.config.recovery_adb", "enabled",
+                                           std::chrono::seconds(5)) ||
+            !android::base::WaitForProperty("ro.adb.secure.recovery", "0",
+                                           std::chrono::seconds(1))) {
+          ui->Print("Could not enable recovery ADB. See recovery logs; you can retry.\n");
+          break;
+        }
         device->RemoveMenuItemForAction(Device::ENABLE_ADB);
         device->GoHome();
-        ui->Print("Enabled ADB.\n");
+        ui->Print("Enabled recovery ADB.\n");
         break;
 
       case Device::INSTALL_MAGISK:
