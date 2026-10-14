@@ -34,11 +34,13 @@ class GRSurfaceDrm : public GRSurface {
   static std::unique_ptr<GRSurfaceDrm> Create(int drm_fd, int width, int height);
 
   uint8_t* data() override {
-    return mmapped_buffer_;
+    return drawing_buffer_ ? drawing_buffer_->data() : mmapped_buffer_;
   }
 
  private:
   friend class MinuiBackendDrm;
+
+  void Flush();
 
   GRSurfaceDrm(size_t width, size_t height, size_t row_bytes, size_t pixel_bytes, int drm_fd,
                uint32_t handle)
@@ -49,6 +51,7 @@ class GRSurfaceDrm : public GRSurface {
   uint32_t fb_id{ 0 };
   uint32_t handle{ 0 };
   uint8_t* mmapped_buffer_{ nullptr };
+  std::shared_ptr<GRSurface> drawing_buffer_;
 };
 
 class MinuiBackendDrm : public MinuiBackend {
@@ -61,6 +64,7 @@ class MinuiBackendDrm : public MinuiBackend {
   void Blank(bool) override;
   void Blank(bool blank, DrmConnector index) override;
   bool HasMultipleConnectors() override;
+  bool HasPersistentBuffer() const override;
 
  private:
   void DrmDisableCrtc(int drm_fd, drmModeCrtc* crtc);
@@ -75,7 +79,12 @@ class MinuiBackendDrm : public MinuiBackend {
     drmModeCrtc* monitor_crtc{ nullptr };
     drmModeConnector* monitor_connector{ nullptr };
     uint32_t selected_mode{ 0 };
+    uint32_t initial_mode{ 0 };
+    bool flip_pending{ false };
+    bool flip_submitted{ false };
   } drm[DRM_MAX];
+
+  bool WaitForFlip(DrmInterface* display);
 
   int drm_fd{ -1 };
   DrmConnector active_display = DRM_MAIN;

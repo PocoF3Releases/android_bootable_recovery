@@ -136,9 +136,13 @@ void gr_flip();
 void gr_fb_blank(bool blank);
 void gr_fb_blank(bool blank, int index);
 bool gr_has_multiple_connectors();
+bool gr_has_persistent_buffer();
 
 // Clears entire surface to current color.
 void gr_clear();
+// Restrict text and fill rendering to a logical-coordinate viewport.
+void gr_clip(int x, int y, int width, int height);
+void gr_reset_clip();
 void gr_color(unsigned char r, unsigned char g, unsigned char b, unsigned char a);
 void gr_fill(int x1, int y1, int x2, int y2);
 

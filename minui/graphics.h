@@ -43,6 +43,11 @@ class MinuiBackend {
   // Return true if the device supports multiple connectors.
   virtual bool HasMultipleConnectors() = 0;
 
+  // Whether drawing retains the previous frame across flips.
+  virtual bool HasPersistentBuffer() const {
+    return false;
+  }
+
   // Device cleanup when drawing is done.
   virtual ~MinuiBackend() = default;
 };

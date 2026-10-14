@@ -16,6 +16,7 @@
 
 #include "graphics_drm.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <stdio.h>
@@ -24,6 +25,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <memory>
 
 #include <android-base/macros.h>
@@ -35,6 +37,12 @@
 #include <android-base/properties.h>
 
 #include "minui/minui.h"
+
+void GRSurfaceDrm::Flush() {
+  if (drawing_buffer_) {
+    memcpy(mmapped_buffer_, drawing_buffer_->data(), row_bytes * height);
+  }
+}
 
 GRSurfaceDrm::~GRSurfaceDrm() {
   if (mmapped_buffer_) {
@@ -140,6 +148,15 @@ std::unique_ptr<GRSurfaceDrm> GRSurfaceDrm::Create(int drm_fd, int width, int he
     return nullptr;
   }
   surface->mmapped_buffer_ = static_cast<uint8_t*>(mmapped);
+  // Render and blend in cached memory. Reading the DRM scanout mapping for
+  // antialiased text makes otherwise small list redraws prohibitively slow.
+  surface->drawing_buffer_ =
+      GRSurface::Create(width, height, create_dumb.pitch, create_dumb.bpp / 8);
+  if (surface->drawing_buffer_) {
+    memset(surface->drawing_buffer_->data(), 0, create_dumb.pitch * height);
+  } else {
+    fprintf(stderr, "Unable to allocate cached drawing surface; using scanout directly\n");
+  }
   printf("Framebuffer of size %llu allocated @ %p\n", create_dumb.size, surface->mmapped_buffer_);
   return surface;
 }
@@ -158,6 +175,7 @@ void MinuiBackendDrm::DrmDisableCrtc(int drm_fd, drmModeCrtc* crtc) {
 bool MinuiBackendDrm::DrmEnableCrtc(int drm_fd, drmModeCrtc* crtc,
                                     const std::unique_ptr<GRSurfaceDrm>& surface,
                                     uint32_t* connector_id) {
+  surface->Flush();
   if (drmModeSetCrtc(drm_fd, crtc->crtc_id, surface->fb_id, 0, 0,  // x,y
                      connector_id, 1,                              // connector_count
                      &crtc->mode) != 0) {
@@ -173,7 +191,7 @@ void MinuiBackendDrm::Blank(bool blank) {
 }
 
 void MinuiBackendDrm::Blank(bool blank, DrmConnector index) {
-  const auto* drmInterface = &drm[DRM_MAIN];
+  auto* drmInterface = &drm[DRM_MAIN];
 
   switch (index) {
     case DRM_MAIN:
@@ -191,6 +209,8 @@ void MinuiBackendDrm::Blank(bool blank, DrmConnector index) {
     fprintf(stderr, "Unsupported. index = %d\n", index);
     return;
   }
+
+  if (!WaitForFlip(&drm[active_display]) || !WaitForFlip(drmInterface)) return;
 
   if (blank) {
     DrmDisableCrtc(drm_fd, drmInterface->monitor_crtc);
@@ -318,6 +338,8 @@ bool MinuiBackendDrm::FindAndSetMonitor(int fd, drmModeRes* resources) {
       }
     }
 
+    drm[drm_index].initial_mode = drm[drm_index].selected_mode;
+
     const int refresh_rate =
         android::base::GetIntProperty("ro.recovery.ui.refresh_rate", 0);
     const auto& preferred = drmConnectors[drm_index]->modes[drm[drm_index].selected_mode];
@@ -412,6 +434,17 @@ GRSurface* MinuiBackendDrm::Init() {
         return nullptr;
       }
 
+      auto& first = drm[i].GRSurfaceDrms[0];
+      auto& second = drm[i].GRSurfaceDrms[1];
+      // A single software canvas retains the complete frame across flips.
+      // The two scanout buffers are still copied only after flip completion.
+      if (first->row_bytes == second->row_bytes) {
+        if (first->drawing_buffer_)
+          second->drawing_buffer_ = first->drawing_buffer_;
+        else if (second->drawing_buffer_)
+          first->drawing_buffer_ = second->drawing_buffer_;
+      }
+
       drm[i].current_buffer = 0;
     }
   }
@@ -419,6 +452,21 @@ GRSurface* MinuiBackendDrm::Init() {
   DisableNonMainCrtcs(drm_fd, res, drm[DRM_MAIN].monitor_crtc);
 
   drmModeFreeResources(res);
+
+  // Establish the preferred mode before changing refresh rate. On command-mode
+  // panels retaining bootloader splash state, selecting the final mode at the
+  // first modeset may leave physical panel timing at the bootloader rate.
+  auto& main_display = drm[DRM_MAIN];
+  if (main_display.initial_mode != main_display.selected_mode) {
+    const auto requested_mode = main_display.monitor_crtc->mode;
+    main_display.monitor_crtc->mode =
+        main_display.monitor_connector->modes[main_display.initial_mode];
+    if (!DrmEnableCrtc(drm_fd, main_display.monitor_crtc, main_display.GRSurfaceDrms[1],
+                       &main_display.monitor_connector->connector_id)) {
+      return nullptr;
+    }
+    main_display.monitor_crtc->mode = requested_mode;
+  }
 
   // We will likely encounter errors in the backend functions (i.e. Flip) if EnableCrtc fails.
   if (!DrmEnableCrtc(drm_fd, drm[DRM_MAIN].monitor_crtc, drm[DRM_MAIN].GRSurfaceDrms[1],
@@ -429,6 +477,13 @@ GRSurface* MinuiBackendDrm::Init() {
   return drm[DRM_MAIN].GRSurfaceDrms[0].get();
 }
 
+bool MinuiBackendDrm::HasPersistentBuffer() const {
+  const auto& display = drm[active_display];
+  return display.GRSurfaceDrms[0] && display.GRSurfaceDrms[1] &&
+         display.GRSurfaceDrms[0]->drawing_buffer_ &&
+         display.GRSurfaceDrms[0]->drawing_buffer_ == display.GRSurfaceDrms[1]->drawing_buffer_;
+}
+
 static void page_flip_complete(__unused int fd,
                                __unused unsigned int sequence,
                                __unused unsigned int tv_sec,
@@ -437,32 +492,30 @@ static void page_flip_complete(__unused int fd,
   *static_cast<bool*>(user_data) = false;
 }
 
-GRSurface* MinuiBackendDrm::Flip() {
-  GRSurface* surface = NULL;
-  DrmInterface* current_drm = &drm[active_display];
-  bool ongoing_flip = true;
-
-  if (!current_drm->monitor_connector) {
-    fprintf(stderr, "Unsupported. active_display = %d\n", active_display);
-    return nullptr;
-  }
-
-  if (drmModePageFlip(drm_fd, current_drm->monitor_crtc->crtc_id,
-                      current_drm->GRSurfaceDrms[current_drm->current_buffer]->fb_id,
-                      DRM_MODE_PAGE_FLIP_EVENT, &ongoing_flip) != 0) {
-    fprintf(stderr, "Failed to drmModePageFlip, active_display=%d", active_display);
-    return nullptr;
-  }
-
-  while (ongoing_flip) {
+bool MinuiBackendDrm::WaitForFlip(DrmInterface* display) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (display->flip_pending) {
     struct pollfd fds = {
       .fd = drm_fd,
       .events = POLLIN
     };
 
-    if (poll(&fds, 1, -1) == -1 || !(fds.revents & POLLIN)) {
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               deadline - std::chrono::steady_clock::now())
+                               .count();
+    if (remaining <= 0) {
+      fprintf(stderr, "Timed out waiting for DRM page flip\n");
+      return false;
+    }
+    const int result = poll(&fds, 1, static_cast<int>(remaining));
+    if (result < 0 && errno == EINTR) continue;
+    if (result == 0) {
+      fprintf(stderr, "Timed out waiting for DRM page flip\n");
+      return false;
+    }
+    if (result < 0 || !(fds.revents & POLLIN)) {
       perror("Failed to poll() on drm fd");
-      break;
+      return false;
     }
 
     drmEventContext evctx = {
@@ -472,17 +525,47 @@ GRSurface* MinuiBackendDrm::Flip() {
 
     if (drmHandleEvent(drm_fd, &evctx) != 0) {
       perror("Failed to drmHandleEvent");
-      break;
+      return false;
     }
   }
 
-  current_drm->current_buffer = 1 - current_drm->current_buffer;
+  if (display->flip_submitted) {
+    display->current_buffer = 1 - display->current_buffer;
+    display->flip_submitted = false;
+  }
+  return true;
+}
+
+GRSurface* MinuiBackendDrm::Flip() {
+  GRSurface* surface = NULL;
+  DrmInterface* current_drm = &drm[active_display];
+
+  if (!current_drm->monitor_connector) {
+    fprintf(stderr, "Unsupported. active_display = %d\n", active_display);
+    return nullptr;
+  }
+
+  if (!WaitForFlip(current_drm)) return nullptr;
+  current_drm->GRSurfaceDrms[current_drm->current_buffer]->Flush();
+  current_drm->flip_pending = true;
+
+  if (drmModePageFlip(drm_fd, current_drm->monitor_crtc->crtc_id,
+                      current_drm->GRSurfaceDrms[current_drm->current_buffer]->fb_id,
+                      DRM_MODE_PAGE_FLIP_EVENT, &current_drm->flip_pending) != 0) {
+    current_drm->flip_pending = false;
+    fprintf(stderr, "Failed to drmModePageFlip, active_display=%d", active_display);
+    return nullptr;
+  }
+
+  current_drm->flip_submitted = true;
+  if (!WaitForFlip(current_drm)) return nullptr;
   surface = current_drm->GRSurfaceDrms[current_drm->current_buffer].get();
   return surface;
 }
 
 MinuiBackendDrm::~MinuiBackendDrm() {
   for (int i = 0; i < DRM_MAX; i++) {
+    WaitForFlip(&drm[i]);
     if (drm[i].monitor_connector) {
       DrmDisableCrtc(drm_fd, drm[i].monitor_crtc);
       drmModeFreeCrtc(drm[i].monitor_crtc);
