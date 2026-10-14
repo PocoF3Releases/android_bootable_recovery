@@ -203,13 +203,14 @@ std::string get_chosen_slot(Device* device) {
   size_t chosen_item = device->GetUI()->ShowMenu(
       headers, items, 0, true,
       std::bind(&Device::HandleMenuKey, device, std::placeholders::_1, std::placeholders::_2));
-  if (chosen_item < 0)
+  if (chosen_item >= items.size())
     return "";
   return items[chosen_item];
 }
 
 int set_slot(Device* device) {
   std::string slot = get_chosen_slot(device);
+  if (slot.empty()) return -1;  // Cancel without calling boot control.
   CommandResult ret;
   auto cb = [&ret](CommandResult result) { ret = result; };
   Slot sslot = (slot == "A") ? 0 : 1;
@@ -749,8 +750,7 @@ change_menu:
       }
 
       case Device::SWAP_SLOT:
-        set_slot(device);
-        reboot_before_magisk = true;
+        if (set_slot(device) >= 0) reboot_before_magisk = true;
         break;
 
       case Device::RUN_GRAPHICS_TEST:
