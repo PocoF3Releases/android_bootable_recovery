@@ -33,6 +33,7 @@ cc_library {
         "device.cpp",
         "ethernet_device.cpp",
         "ethernet_ui.cpp",
+        "credential_ui.cpp",
         "screen_ui.cpp",
         "stub_ui.cpp",
         "ui.cpp",

@@ -258,6 +258,10 @@ status_t ForkExecvp(const std::vector<std::string>& args) {
     const int wait_errno = errno;
     free(argv);
     if (waited == -1) return -wait_errno;
+    // The storage helper uses exit 2 to request credential entry. The caller
+    // reads its private type marker and presents the unlock UI.
+    if (args.size() == 1 && args[0] == "/system/bin/recovery-storage" && WIFEXITED(status) &&
+        WEXITSTATUS(status) == 2) return -EAGAIN;
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         LOG(ERROR) << args[0] << " failed with process status " << status;
         return -EIO;

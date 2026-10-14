@@ -354,6 +354,8 @@ class ScreenRecoveryUI : public RecoveryUI, public DrawInterface {
                   const std::function<int(int, bool)>& key_handler, bool refreshable) override;
   void SetTitle(const std::vector<std::string>& lines) override;
 
+  bool RequestCredential(bool pin, std::string* credential) override;
+
   void KeyLongPress(int) override;
 
   void Redraw();
@@ -546,11 +548,26 @@ class ScreenRecoveryUI : public RecoveryUI, public DrawInterface {
 
   std::vector<std::string> title_lines_;
 
+  struct CredentialKey {
+    int x, y, width, height;
+    std::string label;
+    char character;
+    int action;
+  };
   bool UsePixelScrolling() const override {
     return pixel_scrolling_enabled_.load();
   }
   std::atomic<bool> pixel_scrolling_enabled_{ false };
   Point TranslateTouch(const Point& p) const;
+  void DrawCredentialLocked();
+  bool credential_active_ = false;
+  bool credential_pin_ = true;
+  bool credential_upper_ = false;
+  bool credential_symbols_ = false;
+  bool credential_focus_ = false;
+  size_t credential_length_ = 0;
+  int credential_selection_ = 0;
+  std::vector<CredentialKey> credential_keys_;
 
   std::unique_ptr<Menu> menu_;
   int menu_start_y_;

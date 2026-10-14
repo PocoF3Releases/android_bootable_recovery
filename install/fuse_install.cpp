@@ -17,6 +17,8 @@
 #include "install/fuse_install.h"
 
 #include <dirent.h>
+#include <fcntl.h>
+#include <openssl/crypto.h>
 #include <signal.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
@@ -28,12 +30,15 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
+#include <android-base/file.h>
 #include <android-base/logging.h>
 #include <android-base/scopeguard.h>
 #include <android-base/strings.h>
+#include <android-base/unique_fd.h>
 
 #include "bootloader_message/bootloader_message.h"
 #include "fuse_provider.h"
@@ -98,7 +103,7 @@ std::string BrowseDirectory(const std::string& path, Device* device, RecoveryUI*
   }
 
   std::sort(dirs.begin(), dirs.end());
-  std::sort(entries.begin(), entries.end());
+  std::sort(entries.begin() + 1, entries.end());
 
   // Append dirs to the entries list.
   entries.insert(entries.end(), dirs.begin(), dirs.end());
@@ -219,17 +224,38 @@ InstallResult InstallWithFuseFromPath(std::string_view path, Device* device) {
   return result;
 }
 
+// Credential material exists only in a private RAM file while mounting.
+static std::optional<bool> MountWithCredential(Device* device, VolumeInfo& vi,
+                                               const std::string& type) {
+  std::string credential;
+  credential.reserve(64);
+  auto cleanup = android::base::make_scope_guard([&]() {
+    OPENSSL_cleanse(credential.data(), credential.size());
+    unlink("/tmp/recovery-credential");
+  });
+  if (!device->GetUI()->RequestCredential(type == "3", &credential)) return std::nullopt;
+  android::base::unique_fd fd(
+      open("/tmp/recovery-credential", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600));
+  if (fd < 0 || !android::base::WriteStringToFd(credential, fd.get())) return false;
+  fd.reset();
+  device->GetUI()->Print("Unlocking internal storage...\n");
+  const bool mounted = VolumeManager::Instance()->volumeMount(vi.mId);
+  if (mounted) device->GetUI()->Print("Internal storage unlocked.\n");
+  return mounted;
+}
+
 InstallResult ApplyFromStorage(Device* device, VolumeInfo& vi) {
   auto ui = device->GetUI();
   const auto* data_volume = volume_for_mount_point("/data");
-  const bool needs_crypto = vi.mId == "emulated" && data_volume &&
-      !data_volume->metadata_encryption_options.empty();
+  const bool needs_crypto =
+      vi.mId == "emulated" && data_volume && !data_volume->metadata_encryption_options.empty();
   const auto release_dependencies = [&]() {
     bool success = true;
     if (needs_crypto) {
       // Child mounts must be released before their parent. Installed filesystem
       // keys remain in the kernel; browsing no longer needs the crypto HALs.
-      for (const char* mount : {"/vendor/firmware_mnt", "/mnt/vendor/persist", "/odm", "/vendor"}) {
+      for (const char* mount :
+           { "/vendor/firmware_mnt", "/mnt/vendor/persist", "/odm", "/vendor" }) {
         if (volume_for_mount_point(mount) && ensure_path_unmounted(mount) != 0) {
           LOG(ERROR) << "Unable to release storage dependency: " << mount;
           success = false;
@@ -251,16 +277,28 @@ InstallResult ApplyFromStorage(Device* device, VolumeInfo& vi) {
       ui->Print("Unable to mount encryption metadata.\n");
       return INSTALL_ERROR;
     }
-    for (const char* mount : {"/vendor", "/odm", "/vendor/firmware_mnt", "/mnt/vendor/persist"}) {
+    for (const char* mount : { "/vendor", "/odm", "/vendor/firmware_mnt", "/mnt/vendor/persist" }) {
       if (volume_for_mount_point(mount) && ensure_path_mounted(mount) != 0) {
         ui->Print("Unable to mount storage dependency: %s\n", mount);
         return INSTALL_ERROR;
       }
     }
   }
-  const bool mounted = VolumeManager::Instance()->volumeMount(vi.mId);
+  unlink("/tmp/recovery-credential");
+  bool mounted = VolumeManager::Instance()->volumeMount(vi.mId);
+  std::string credential_type;
+  bool cancelled = false;
+  if (!mounted && needs_crypto &&
+      android::base::ReadFileToString("/tmp/recovery-credential-type", &credential_type) &&
+      (credential_type == "3" || credential_type == "4")) {
+    const auto result = MountWithCredential(device, vi, credential_type);
+    cancelled = !result.has_value();
+    mounted = result.value_or(false);
+  }
+  unlink("/tmp/recovery-credential-type");
   const bool released = release_dependencies();
   dependency_cleanup.Disable();
+  if (cancelled && released) return INSTALL_NONE;
   if (!mounted || !released) {
     if (mounted) VolumeManager::Instance()->volumeUnmount(vi.mId);
     ui->Print("Storage is locked or unavailable.\n");
@@ -282,7 +320,8 @@ InstallResult ApplyFromStorage(Device* device, VolumeInfo& vi) {
   SetSdcardUpdateBootloaderMessage();
 
   auto result = android::base::EndsWithIgnoreCase(path, ".img")
-      ? InstallRawImage(path, device) : InstallWithFuseFromPath(path, device);
+                    ? InstallRawImage(path, device)
+                    : InstallWithFuseFromPath(path, device);
 
   VolumeManager::Instance()->volumeUnmount(vi.mId);
   return result;
