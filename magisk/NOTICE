@@ -1,0 +1,7 @@
+Bundled Magisk v31.0, unmodified official release APK.
+Upstream: https://github.com/topjohnwu/Magisk/releases/tag/v31.0
+Corresponding source and build instructions: https://github.com/topjohnwu/Magisk/tree/v31.0
+SHA256: 2c8a488b9a5293e578e95ae4f07e3c57aba4feec4a52ca4dd852a2692d6dd4e8
+License: GPL-3.0-only; see LICENSE.
+The recovery adapter stages installation in RAM and retains upstream boot patching.
+It does not install the Android manager app or create persistent stock-boot backups.

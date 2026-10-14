@@ -148,6 +148,7 @@ cc_library_static {
 
     srcs: [
         "recovery.cpp",
+        "magisk_install.cpp",
     ],
 
     shared_libs: [
@@ -199,6 +200,8 @@ cc_binary {
         "mkshrc.recovery",
         "reboot.recovery",
         "recovery_deps",
+        "recovery_bundled_magisk",
+        "recovery_bundled_magisk_script",
         "ueventd.rc.recovery",
     ],
 }
