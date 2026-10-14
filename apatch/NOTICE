@@ -1,0 +1,9 @@
+Bundled APatch 11224, unmodified official release APK.
+Release: https://github.com/bmax121/APatch/releases/tag/11224
+Source and build instructions: https://github.com/bmax121/APatch/tree/11224
+KernelPatch source: https://github.com/bmax121/KernelPatch
+SHA256: f1986f9a9c3b2b2d5ca09aa6b9ef24226fef662f8faf5677ce1447ffcae68590
+License: GPL-3.0-only; see LICENSE.
+The adapter uses official kptools and kpimg in RAM, with checked failures and boot writes.
+Install APatch Manager in Android after reboot; this action installs no Android app.
+It creates no persistent stock-boot backup and uses upstream default SuperKey behavior.

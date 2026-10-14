@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-#include "magisk_install.h"
+#include "root_install.h"
 
 #include <fcntl.h>
 #include <ftw.h>
@@ -31,9 +31,21 @@
 #include "recovery_utils/roots.h"
 
 namespace {
-constexpr char kPackage[] = "/system/etc/recovery/magisk.apk";
-constexpr char kAdapter[] = "/system/etc/recovery/install-magisk.sh";
-constexpr char kSha256[] = "2c8a488b9a5293e578e95ae4f07e3c57aba4feec4a52ca4dd852a2692d6dd4e8";
+struct InstallerSpec {
+  const char* package;
+  const char* adapter;
+  const char* sha256;
+  const char* label;
+  bool apatch;
+};
+constexpr InstallerSpec kMagisk{ "/system/etc/recovery/magisk.apk",
+                                 "/system/etc/recovery/install-magisk.sh",
+                                 "2c8a488b9a5293e578e95ae4f07e3c57aba4feec4a52ca4dd852a2692d6dd4e8",
+                                 "Magisk v31.0", false };
+constexpr InstallerSpec kAPatch{ "/system/etc/recovery/apatch.apk",
+                                 "/system/etc/recovery/install-apatch.sh",
+                                 "f1986f9a9c3b2b2d5ca09aa6b9ef24226fef662f8faf5677ce1447ffcae68590",
+                                 "APatch 11224", true };
 
 #if defined(__aarch64__)
 constexpr char kBusyboxEntry[] = "lib/arm64-v8a/libbusybox.so";
@@ -75,11 +87,11 @@ class RamWorkspace {
   }
 
  private:
-  char path_[sizeof("/tmp/evox-magisk-XXXXXX")] = "/tmp/evox-magisk-XXXXXX";
+  char path_[sizeof("/tmp/evox-root-XXXXXX")] = "/tmp/evox-root-XXXXXX";
   bool valid_;
 };
 
-bool VerifyPackage(const std::string& content) {
+bool VerifyPackage(const std::string& content, const char* expected) {
   std::array<unsigned char, SHA256_DIGEST_LENGTH> digest;
   SHA256(reinterpret_cast<const unsigned char*>(content.data()), content.size(), digest.data());
   constexpr char hex[] = "0123456789abcdef";
@@ -88,15 +100,15 @@ bool VerifyPackage(const std::string& content) {
     actual += hex[c >> 4];
     actual += hex[c & 15];
   }
-  return actual == kSha256;
+  return actual == expected;
 }
 
-bool ExtractBusybox(const std::string& package, const std::string& path) {
+bool ExtractTool(const std::string& package, const char* name, const std::string& path) {
   ZipArchiveHandle archive;
   if (OpenArchive(package.c_str(), &archive) != 0) return false;
   ZipEntry64 entry;
   bool ok = false;
-  if (FindEntry(archive, kBusyboxEntry, &entry) == 0) {
+  if (FindEntry(archive, name, &entry) == 0) {
     android::base::unique_fd fd(open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0700));
     ok = fd.ok() && ExtractEntryToFile(archive, &entry, fd.get()) == 0;
   }
@@ -104,13 +116,13 @@ bool ExtractBusybox(const std::string& package, const std::string& path) {
   return ok;
 }
 
-bool RunInstaller(RecoveryUI* ui, const std::string& work) {
+bool RunInstaller(RecoveryUI* ui, const std::string& work, const InstallerSpec& spec) {
   android::base::unique_fd reader, writer;
   // The updater protocol descriptor must survive exec. All other staging FDs are closed.
   if (!android::base::Pipe(&reader, &writer, 0)) return false;
   const std::string busybox = work + "/busybox";
-  const std::string script = work + "/install-magisk.sh";
-  const std::string package = work + "/magisk.apk";
+  const std::string script = work + "/install-root.sh";
+  const std::string package = work + "/root.apk";
   const std::string outfd = std::to_string(writer.get());
   // Snapshot platform metadata while recovery's toolbox/libraries are still
   // visible. Magisk mounts Android over /system only in the child namespace.
@@ -120,6 +132,12 @@ bool RunInstaller(RecoveryUI* ui, const std::string& work) {
     return false;
   }
   const std::string api = std::to_string(sdk);
+  const std::string slot = android::base::GetProperty("ro.boot.slot_suffix", "");
+  if (spec.apatch && slot != "" && slot != "_a" && slot != "_b") {
+    ui->Print("Cannot determine the active boot slot.\n");
+    return false;
+  }
+  const std::string boot = "/dev/block/by-name/boot" + slot;
   pid_t child = fork();
   if (child == -1) return false;
   if (child == 0) {
@@ -136,6 +154,7 @@ bool RunInstaller(RecoveryUI* ui, const std::string& work) {
     }
     if (setenv("EVO_MAGISK_API", api.c_str(), 1) == -1 || setenv("EVO_MAGISK_ABI", kAbi, 1) == -1 ||
         setenv("EVO_MAGISK_WORK", work.c_str(), 1) == -1 ||
+        setenv("EVO_APATCH_BOOT", boot.c_str(), 1) == -1 ||
         setenv("BBBIN", busybox.c_str(), 1) == -1 || setenv("ASH_STANDALONE", "1", 1) == -1) {
       _exit(126);
     }
@@ -162,7 +181,7 @@ bool RunInstaller(RecoveryUI* ui, const std::string& work) {
         ui->Print("%s\n", command.substr(9).c_str());
       } else {
         // Archive extraction and binary diagnostics go to the recovery log.
-        LOG(INFO) << "Magisk: " << command;
+        LOG(INFO) << spec.label << ": " << command;
       }
     }
     free(line);
@@ -172,64 +191,89 @@ bool RunInstaller(RecoveryUI* ui, const std::string& work) {
   int status = 0;
   pid_t waited = TEMP_FAILURE_RETRY(waitpid(child, &status, 0));
   if (waited != child) {
-    ui->Print("Could not wait for Magisk installer: %s\n", strerror(errno));
+    ui->Print("Could not wait for root installer: %s\n", strerror(errno));
     return false;
   }
   if (WIFSIGNALED(status)) {
-    ui->Print("Magisk installer terminated by signal %d.\n", WTERMSIG(status));
+    ui->Print("%s installer terminated by signal %d.\n", spec.label, WTERMSIG(status));
     return false;
   }
   if (!WIFEXITED(status) || WEXITSTATUS(status) != 0 || !read_ok) {
     if (WIFEXITED(status))
-      ui->Print("Magisk installer exited with status %d.\n", WEXITSTATUS(status));
-    if (!read_ok) ui->Print("Could not read Magisk installer output.\n");
-    LOG(ERROR) << "Bundled Magisk installer failed";
+      ui->Print("%s installer exited with status %d.\n", spec.label, WEXITSTATUS(status));
+    if (!read_ok) ui->Print("Could not read root installer output.\n");
+    LOG(ERROR) << spec.label << " installer failed";
     return false;
   }
   sync();
   return true;
 }
-}  // namespace
-
-bool InstallBundledMagisk(RecoveryUI* ui) {
+bool InstallBundledRoot(RecoveryUI* ui, const InstallerSpec& spec) {
+  if (spec.apatch && std::string(kAbi) != "arm64-v8a") {
+    ui->Print("APatch requires an ARM64 recovery and kernel.\n");
+    return false;
+  }
   ui->ShowText(true);
   RamWorkspace ram;
   if (!ram.valid()) {
-    ui->Print("Cannot create Magisk workspace in recovery RAM.\n");
+    ui->Print("Cannot create root installer workspace in recovery RAM.\n");
     return false;
   }
   // Copy before Magisk mounts Android over /system in its own namespace.
   std::string content;
-  if (!android::base::ReadFileToString(kPackage, &content) || !VerifyPackage(content)) {
-    ui->Print("Bundled Magisk is missing or failed checksum verification.\n");
+  if (!android::base::ReadFileToString(spec.package, &content) ||
+      !VerifyPackage(content, spec.sha256)) {
+    ui->Print("Bundled root package is missing or failed checksum verification.\n");
     return false;
   }
-  const std::string package = ram.path() + "/magisk.apk";
+  const std::string package = ram.path() + "/root.apk";
   std::string adapter;
   if (!android::base::WriteStringToFile(content, package) ||
-      !android::base::ReadFileToString(kAdapter, &adapter) ||
-      !android::base::WriteStringToFile(adapter, ram.path() + "/install-magisk.sh") ||
-      !ExtractBusybox(package, ram.path() + "/busybox")) {
-    ui->Print("Cannot prepare bundled Magisk in recovery RAM.\n");
+      !android::base::ReadFileToString(spec.adapter, &adapter) ||
+      !android::base::WriteStringToFile(adapter, ram.path() + "/install-root.sh") ||
+      !ExtractTool(package, kBusyboxEntry, ram.path() + "/busybox")) {
+    ui->Print("Cannot prepare bundled root installer in recovery RAM.\n");
     return false;
   }
+  if (spec.apatch) {
+    std::string magisk;
+    if (!android::base::ReadFileToString(kMagisk.package, &magisk) ||
+        !VerifyPackage(magisk, kMagisk.sha256) ||
+        !android::base::WriteStringToFile(magisk, ram.path() + "/magisk-tools.apk") ||
+        !ExtractTool(ram.path() + "/magisk-tools.apk", "lib/arm64-v8a/libmagiskboot.so",
+                     ram.path() + "/magiskboot")) {
+      ui->Print("Cannot prepare verified boot inspection tools.\n");
+      return false;
+    }
+  }
   // Magisk's upstream installer needs the logical system partition for detection.
-  if (!logical_partitions_mapped()) {
+  if (!spec.apatch && !logical_partitions_mapped()) {
     if (!CreateSnapshotPartitions()) {
       ui->Print("Cannot prepare system partitions for Magisk.\n");
       return false;
     }
     map_logical_partitions();
   }
-  ui->Print("Installing bundled Magisk v31.0...\n");
+  ui->Print("Installing bundled %s...\n", spec.label);
   ui->SetBackground(RecoveryUI::INSTALLING_UPDATE);
   ui->SetProgressType(RecoveryUI::INDETERMINATE);
   ui->SetEnableReboot(false);
-  bool success = RunInstaller(ui, ram.path());
+  bool success = RunInstaller(ui, ram.path(), spec);
   ui->SetEnableReboot(true);
   ui->SetProgressType(RecoveryUI::EMPTY);
   ui->SetBackground(success ? RecoveryUI::NO_COMMAND : RecoveryUI::ERROR);
-  ui->Print(success ? "Magisk installation completed. Reboot system to use root.\n"
-                    : "Magisk installation failed. See recovery logs for details.\n");
+  ui->Print(success ? "%s installation completed.\n"
+                    : "%s installation failed. See recovery logs for details.\n",
+            spec.label);
   return success;
+}
+
+}  // namespace
+
+bool InstallBundledMagisk(RecoveryUI* ui) {
+  return InstallBundledRoot(ui, kMagisk);
+}
+
+bool InstallBundledAPatch(RecoveryUI* ui) {
+  return InstallBundledRoot(ui, kAPatch);
 }

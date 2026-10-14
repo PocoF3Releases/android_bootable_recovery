@@ -56,7 +56,7 @@
 #include "install/snapshot_utils.h"
 #include "install/wipe_data.h"
 #include "install/wipe_device.h"
-#include "magisk_install.h"
+#include "root_install.h"
 #include "otautil/error_code.h"
 #include "otautil/package.h"
 #include "otautil/paths.h"
@@ -713,25 +713,29 @@ change_menu:
         break;
 
       case Device::INSTALL_MAGISK:
+      case Device::INSTALL_APATCH: {
+        const bool apatch = chosen_action == Device::INSTALL_APATCH;
         if (update_in_progress || reboot_before_magisk) {
-          ui->Print("Reboot recovery after an update or slot change before installing Magisk.\n");
+          ui->Print("Reboot recovery after an update or slot change before installing root.\n");
           break;
         }
         if (android::base::GetBoolProperty("ro.virtual_ab.enabled", false) &&
             !IsCancelUpdateSafe(device)) {
-          ui->Print("Finish the pending system update before installing Magisk.\n");
+          ui->Print("Finish the pending system update before installing root.\n");
           break;
         }
-        if (yes_no(device, "Install bundled Magisk v31.0?",
-                   "This modifies the current slot's boot image to enable root.")) {
+        if (yes_no(device, apatch ? "Install bundled APatch 11224?" : "Install bundled Magisk v31.0?",
+                   "Modifies current boot; no persistent backup. Install manager after reboot.")) {
           save_current_log = true;
-          status = InstallBundledMagisk(ui) ? INSTALL_SUCCESS : INSTALL_ERROR;
+          const bool success = apatch ? InstallBundledAPatch(ui) : InstallBundledMagisk(ui);
+          status = success ? INSTALL_SUCCESS : INSTALL_ERROR;
           copy_logs(save_current_log);
           // Keep the result available instead of immediately hiding it behind a menu.
           for (;;) {
             std::vector<std::string> result_headers{
-              status == INSTALL_SUCCESS ? "Magisk installation completed" : "Magisk installation failed",
-              status == INSTALL_SUCCESS ? "Reboot system to use root." : "Open the recovery log for details."
+              status == INSTALL_SUCCESS ? "Root installation completed" : "Root installation failed",
+              status == INSTALL_SUCCESS ? "Reboot system, then install the matching manager app."
+                                       : "Open the recovery log for details."
             };
             size_t result_item = ui->ShowMenu(
                 result_headers, { "Continue", "View recovery log" }, 0, true,
@@ -742,6 +746,7 @@ change_menu:
           }
         }
         break;
+      }
 
       case Device::SWAP_SLOT:
         set_slot(device);

@@ -75,6 +75,7 @@ class Device {
     ENABLE_ADB = 101,
     SWAP_SLOT = 102,
     INSTALL_MAGISK = 103,
+    INSTALL_APATCH = 104,
     MENU_BASE = 200,
     MENU_WIPE = 202,
     MENU_ADVANCED = 203,

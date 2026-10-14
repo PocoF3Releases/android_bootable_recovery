@@ -1,0 +1,26 @@
+package {
+    default_applicable_licenses: ["recovery_bundled_apatch_license"],
+}
+
+license {
+    name: "recovery_bundled_apatch_license",
+    visibility: [":__subpackages__"],
+    license_kinds: ["SPDX-license-identifier-GPL-3.0-only"],
+    license_text: ["LICENSE"],
+}
+
+prebuilt_etc {
+    name: "recovery_bundled_apatch",
+    recovery: true,
+    src: "APatch-11224.apk",
+    filename: "apatch.apk",
+    sub_dir: "recovery",
+}
+
+prebuilt_etc {
+    name: "recovery_bundled_apatch_script",
+    recovery: true,
+    src: "install-apatch.sh",
+    filename: "install-apatch.sh",
+    sub_dir: "recovery",
+}
