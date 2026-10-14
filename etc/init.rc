@@ -59,11 +59,8 @@ on init
     symlink /dev/binderfs/hwbinder /dev/hwbinder
     chmod 0666 /dev/binderfs/hwbinder
 
-    restorecon /plat_hwservice_contexts /plat_keystore2_key_contexts
-    restorecon /system /system/bin
-    restorecon /system/bin/hwservicemanager /system/bin/keystore2
-    restorecon /system/bin/linker /system/bin/linker64
-    restorecon_recursive /system/etc /system/lib /system/lib64
+    # Ramdisk executables retain rootfs labels; recovery-only transitions
+    # authorize the explicitly labeled crypto services without relabeling /system.
     restorecon_recursive /dev/binderfs
 
     # Start essential services
