@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <memory>
 #include <string>
 #include <thread>
@@ -42,6 +43,7 @@
 #include <android-base/chrono_utils.h>
 #include <android-base/logging.h>
 #include <android-base/properties.h>
+#include <android-base/scopeguard.h>
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
 
@@ -72,16 +74,16 @@ int Menu::selection() const {
   return selection_;
 }
 
-TextMenu::TextMenu(bool wrappable, size_t max_length,
-                   const std::vector<std::string>& headers, const std::vector<std::string>& items,
-                   size_t initial_selection, int char_height, const DrawInterface& draw_funcs)
+TextMenu::TextMenu(bool wrappable, size_t max_length, const std::vector<std::string>& headers,
+                   const std::vector<std::string>& items, size_t initial_selection, int char_height,
+                   const DrawInterface& draw_funcs)
     : Menu(initial_selection, draw_funcs),
       wrappable_(wrappable),
-      calibrated_height_(false),
+      max_display_items_(0),
       max_item_length_(max_length),
       text_headers_(headers),
+      menu_start_(0),
       char_height_(char_height) {
-
   size_t items_count = items.size();
   for (size_t i = 0; i < items_count; ++i) {
     text_items_.emplace_back(items[i].substr(0, max_item_length_));
@@ -105,7 +107,7 @@ size_t TextMenu::MenuStart() const {
 }
 
 size_t TextMenu::MenuEnd() const {
-  return std::min(ItemsCount(), menu_start_ + max_display_items_);
+  return std::min(ItemsCount(), menu_start_ + max_display_items_ + (scroll_offset_ != 0));
 }
 
 size_t TextMenu::ItemsCount() const {
@@ -127,7 +129,7 @@ int TextMenu::Select(int sel) {
   CHECK_LE(ItemsCount(), static_cast<size_t>(std::numeric_limits<int>::max()));
   int count = ItemsCount();
 
-  int min = IsMain() ? 0 : -1; // -1 is back arrow
+  int min = IsMain() ? 0 : -1;  // -1 is back arrow
 
   if (sel < min) {
     selection_ = wrappable() ? count - 1 : min;
@@ -137,6 +139,7 @@ int TextMenu::Select(int sel) {
     selection_ = sel;
   }
 
+  scroll_offset_ = 0;
   if (selection_ >= 0) {
     if (selection_ < menu_start_) {
       menu_start_ = selection_;
@@ -171,7 +174,22 @@ int TextMenu::Scroll(int updown) {
       selection_ = menu_start_ + max_display_items_ - 1;
     }
   }
+  scroll_offset_ = 0;
   return selection_;
+}
+
+bool TextMenu::ScrollPixels(int delta) {
+  if (ItemsCount() <= max_display_items_) return false;
+  const int stride = draw_funcs_.MenuItemHeight() + draw_funcs_.MenuItemSpacing();
+  const int64_t previous = static_cast<int64_t>(menu_start_) * stride + scroll_offset_;
+  const int64_t maximum = static_cast<int64_t>(ItemsCount() - max_display_items_) * stride;
+  const int64_t next = std::clamp(previous - delta, int64_t{ 0 }, maximum);
+  if (next == previous) return false;
+  menu_start_ = next / stride;
+  scroll_offset_ = next % stride;
+  selection_ = std::clamp(selection_, static_cast<int>(menu_start_),
+                          static_cast<int>(menu_start_ + max_display_items_ - 1));
+  return true;
 }
 
 int TextMenu::DrawHeader(int x, int y) const {
@@ -192,7 +210,12 @@ int TextMenu::DrawItems(int x, int y, int screen_width, bool long_press) const {
   draw_funcs_.SetColor(UIElement::MENU);
   offset += horizontal_rule_height + 4;
 
-  int item_container_offset = offset; // store it for drawing scrollbar on most top
+  const int item_container_offset = offset;
+  const int stride = 2 * padding + char_height_ + spacing;
+  const int container_height = max_display_items_ * stride;
+  gr_clip(0, y + item_container_offset, screen_width, container_height);
+  auto clip_guard = android::base::make_scope_guard([] { gr_reset_clip(); });
+  offset -= scroll_offset_;
 
   for (size_t i = MenuStart(); i < MenuEnd(); ++i) {
     const auto selected = i == selection();
@@ -203,7 +226,8 @@ int TextMenu::DrawItems(int x, int y, int screen_width, bool long_press) const {
                                     : UIElement::MENU_BG);
 
     int bar_height = padding + char_height_ + padding;
-    draw_funcs_.DrawHighlightBar(padding + x, y + offset, screen_width - (padding + x) * 2, bar_height);
+    draw_funcs_.DrawHighlightBar(padding + x, y + offset, screen_width - (padding + x) * 2,
+                                 bar_height);
 
     draw_funcs_.SetColor(selected ? UIElement::MENU_SEL_FG : UIElement::MENU);
     offset += draw_funcs_.DrawTextLine(padding * 2 + x, y + offset, TextItem(i), false /* bold */);
@@ -213,14 +237,17 @@ int TextMenu::DrawItems(int x, int y, int screen_width, bool long_press) const {
 
   std::string unused;
   if (ItemsOverflow(&unused)) {
-    int container_height = max_display_items_ * (2 * padding + char_height_ + spacing);
-    int bar_height = container_height / (text_items_.size() - max_display_items_ + 1);
-    int start_y = y + item_container_offset + bar_height * menu_start_;
+    const int bar_height = std::max(
+        1, static_cast<int>(container_height / (text_items_.size() - max_display_items_ + 1)));
+    const int64_t position = static_cast<int64_t>(menu_start_) * stride + scroll_offset_;
+    const int64_t maximum = static_cast<int64_t>(ItemsCount() - max_display_items_) * stride;
+    const int start_y =
+        y + item_container_offset + (container_height - bar_height) * position / maximum;
     draw_funcs_.SetColor(UIElement::SCROLLBAR);
     draw_funcs_.DrawScrollBar(start_y, bar_height);
   }
 
-  return offset;
+  return item_container_offset + std::min(container_height, offset - item_container_offset);
 }
 
 GraphicMenu::GraphicMenu(const GRSurface* graphic_headers,
@@ -852,15 +879,37 @@ void ScreenRecoveryUI::draw_menu_and_text_buffer_locked(
     int x = margin_width_ + kMenuIndent;
     if (!title_lines_.empty()) {
       SetColor(UIElement::INFO);
-      y += DrawTextLines(x, y, title_lines_);
+      bool first_line = true;
+      for (const auto& line : title_lines_) {
+        size_t start = 0;
+        do {
+          const int battery_chars =
+              static_cast<int>(std::to_string(batt_capacity_).size()) + 1 + charging_;
+          const int right = first_line && !is_battery_less
+                                ? ScreenWidth() - margin_width_ * 2 - kMenuIndent -
+                                      (battery_chars + 3) * char_width_
+                                : ScreenWidth() - x;
+          const size_t columns = std::max(1, (right - x) / char_width_);
+          size_t end = std::min(line.size(), start + columns);
+          if (end < line.size()) {
+            const auto split = line.find_last_of(" \t-", end - 1);
+            if (split != std::string::npos && split > start && split - start >= columns / 2)
+              end = split + (line[split] == '-');
+          }
+          y += DrawTextLine(x, y, line.substr(start, end - start), false);
+          first_line = false;
+          start = end;
+          while (start < line.size() && line[start] == ' ') ++start;
+        } while (start < line.size());
+      }
     }
     y += menu_->DrawHeader(x, y);
-    menu_start_y_ = y + 12; // Skip horizontal rule and some margin
+    menu_start_y_ = y + 12;  // Skip horizontal rule and some margin
     menu_->SetMenuHeight(std::max(0, ScreenHeight() - menu_start_y_));
     y += menu_->DrawItems(x, y, ScreenWidth(), IsLongPress());
     if (!help_message.empty()) {
       y -= MenuItemSpacing();
-      y += 12; // Skip horizontal rule and some margin
+      y += 12;  // Skip horizontal rule and some margin
       SetColor(UIElement::INFO);
       y += DrawTextLines(x, y, help_message);
     }
@@ -882,7 +931,8 @@ void ScreenRecoveryUI::draw_menu_and_text_buffer_locked(
 // Draws the battery capacity on the screen. Should only be called with updateMutex locked.
 void ScreenRecoveryUI::draw_battery_capacity_locked() {
   int x;
-  int y = margin_height_ + gr_get_height(lineage_logo_.get());
+  const auto& logo = fastbootd_logo_enabled_ ? fastbootd_logo_ : lineage_logo_;
+  int y = margin_height_ + gr_get_height(logo.get());
   int icon_x, icon_y, icon_h, icon_w;
 
   if (is_battery_less) return;
@@ -1488,16 +1538,17 @@ int ScreenRecoveryUI::SelectMenu(int sel) {
   std::lock_guard<std::mutex> lg(updateMutex);
   if (menu_) {
     int old_sel = menu_->selection();
+    const int old_offset = menu_->ScrollOffset();
     sel = menu_->Select(sel);
 
-    if (sel != old_sel) {
+    if (sel != old_sel || menu_->ScrollOffset() != old_offset) {
       update_screen_locked();
     }
   }
   return sel;
 }
 
-int ScreenRecoveryUI::SelectMenu(const Point& p) {
+Point ScreenRecoveryUI::TranslateTouch(const Point& p) const {
   Point point;
 
   const auto scaleX = static_cast<double>(p.x()) / ScreenWidth();
@@ -1527,6 +1578,12 @@ int ScreenRecoveryUI::SelectMenu(const Point& p) {
   point.x(point.x() - gr_overscan_offset_x());
   point.y(point.y() - gr_overscan_offset_y());
 
+  return point;
+}
+
+int ScreenRecoveryUI::SelectMenu(const Point& p) {
+  const Point point = TranslateTouch(p);
+
   int new_sel = Device::kNoAction;
   std::lock_guard<std::mutex> lg(updateMutex);
   if (menu_) {
@@ -1540,8 +1597,8 @@ int ScreenRecoveryUI::SelectMenu(const Point& p) {
       const static int icon_x = centered_x / 2 - icon_w / 2;
       const static int icon_y = margin_height_ + logo_height / 2 - icon_h / 2;
 
-      if (point.x() >= icon_x && point.x() <= icon_x + icon_w &&
-          point.y() >= icon_y && point.y() <= icon_y + icon_h) {
+      if (point.x() >= icon_x && point.x() <= icon_x + icon_w && point.y() >= icon_y &&
+          point.y() <= icon_y + icon_h) {
         return Device::kGoBack;
       }
     }
@@ -1550,16 +1607,19 @@ int ScreenRecoveryUI::SelectMenu(const Point& p) {
     const int menu_item_height_with_spacing = menu_item_height + MenuItemSpacing();
 
     if (point.y() >= menu_start_y_ &&
-        point.y() < menu_start_y_ + menu_->ItemsCount() * menu_item_height_with_spacing) {
+        point.y() < menu_start_y_ + menu_->VisibleItemsCount() * menu_item_height_with_spacing) {
       int old_sel = menu_->selection();
-      int relative_sel = (point.y() - menu_start_y_) / menu_item_height_with_spacing;
-      int menu_item_start_y = menu_start_y_ + (relative_sel * menu_item_height_with_spacing);
+      const int old_offset = menu_->ScrollOffset();
+      int relative_sel =
+          (point.y() - menu_start_y_ + menu_->ScrollOffset()) / menu_item_height_with_spacing;
+      int menu_item_start_y =
+          menu_start_y_ + relative_sel * menu_item_height_with_spacing - menu_->ScrollOffset();
       if (point.y() > menu_item_start_y + menu_item_height) {
         // The touch is in the spacing area between two menu items.
         return Device::kNoAction;
       }
       new_sel = menu_->SelectVisible(relative_sel);
-      if (new_sel != -1 && new_sel != old_sel) {
+      if (new_sel != -1 && (new_sel != old_sel || menu_->ScrollOffset() != old_offset)) {
         update_screen_locked();
       }
     }
@@ -1577,10 +1637,33 @@ int ScreenRecoveryUI::ScrollMenu(int updown) {
   return sel;
 }
 
+int ScreenRecoveryUI::ScrollMenuPixels(int delta) {
+  std::lock_guard<std::mutex> lock(updateMutex);
+  if (!menu_) return Device::kNoAction;
+  if (menu_->ScrollPixels(delta)) {
+    if (gr_has_persistent_buffer()) {
+      // The header is unchanged while dragging. Preserve it and redraw the
+      // list and any log lines below it on the persistent software canvas.
+      gr_clip(0, menu_start_y_, ScreenWidth(), ScreenHeight() - menu_start_y_);
+      gr_color(0, 0, 0, 255);
+      gr_fill(0, menu_start_y_, ScreenWidth(), ScreenHeight());
+      draw_menu_and_text_buffer_locked(GetMenuHelpMessage());
+      gr_reset_clip();
+      gr_flip();
+    } else {
+      update_screen_locked();
+    }
+  }
+  return menu_->selection();
+}
+
 size_t ScreenRecoveryUI::ShowMenu(std::unique_ptr<Menu>&& menu, bool menu_only,
                                   const std::function<int(int, bool)>& key_handler,
                                   bool refreshable) {
   // Throw away keys pressed previously, so user doesn't accidentally trigger menu items.
+  const bool old_pixel_scrolling = pixel_scrolling_enabled_.exchange(true);
+  auto scrolling_guard = android::base::make_scope_guard(
+      [&]() { pixel_scrolling_enabled_.store(old_pixel_scrolling); });
   FlushKeys();
 
   // If there is a key interrupt in progress, return KeyError::INTERRUPTED without starting the
@@ -1614,6 +1697,10 @@ size_t ScreenRecoveryUI::ShowMenu(std::unique_ptr<Menu>&& menu, bool menu_only,
       }
     }
 
+    if (evt.type() == EventType::SCROLL) {
+      selected = ScrollMenuPixels(evt.pos().y());
+      continue;
+    }
     int action = Device::kNoAction;
     if (evt.type() == EventType::TOUCH) {
       int touch_sel = SelectMenu(evt.pos());
@@ -1689,8 +1776,7 @@ size_t ScreenRecoveryUI::ShowMenu(std::unique_ptr<Menu>&& menu, bool menu_only,
 
 size_t ScreenRecoveryUI::ShowMenu(const std::vector<std::string>& headers,
                                   const std::vector<std::string>& items, size_t initial_selection,
-                                  bool menu_only,
-                                  const std::function<int(int, bool)>& key_handler,
+                                  bool menu_only, const std::function<int(int, bool)>& key_handler,
                                   bool refreshable) {
   auto menu = CreateMenu(headers, items, initial_selection);
   if (menu == nullptr) {

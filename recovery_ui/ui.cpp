@@ -26,6 +26,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <functional>
 #include <string>
@@ -269,6 +270,8 @@ void RecoveryUI::CalibrateTouch(int fd) {
 
 void RecoveryUI::OnTouchPress() {
   touch_start_ = touch_track_ = touch_pos_;
+  touch_scrolling_ = false;
+  legacy_touch_scroll_ = 0;
 }
 
 void RecoveryUI::OnTouchTrack() {
@@ -296,14 +299,44 @@ void RecoveryUI::OnTouchTrack() {
         break;
     }
 
-    while (abs(point.y() - touch_track_.y()) >= MenuItemHeight()) {
-      int dy = point.y() - touch_track_.y();
-      int key = (dy < 0) ? KEY_SCROLLDOWN : KEY_SCROLLUP;
-      ProcessKey(key, 1);  // press key
-      ProcessKey(key, 0);  // and release it
-      int sgn = (dy > 0) - (dy < 0);
-      touch_track_.y(touch_track_.y() + sgn * MenuItemHeight());
+    int previous_y = touch_track_.y();
+    int start_y = touch_start_.y();
+    switch (gr_touch_rotation()) {
+      case GRRotation::RIGHT:
+        previous_y =
+            gr_fb_height_real() - touch_track_.x() * gr_fb_height_real() / gr_fb_width_real();
+        start_y = gr_fb_height_real() - touch_start_.x() * gr_fb_height_real() / gr_fb_width_real();
+        break;
+      case GRRotation::DOWN:
+        previous_y = gr_fb_height_real() - touch_track_.y();
+        start_y = gr_fb_height_real() - touch_start_.y();
+        break;
+      case GRRotation::LEFT:
+        previous_y = touch_track_.x() * gr_fb_height_real() / gr_fb_width_real();
+        start_y = touch_start_.x() * gr_fb_height_real() / gr_fb_width_real();
+        break;
+      case GRRotation::NONE:
+        break;
     }
+    const int slop = std::max(8, MenuItemHeight() / 6);
+    if (!touch_scrolling_ && abs(point.y() - start_y) < slop) return;
+    touch_scrolling_ = true;
+    const int delta = point.y() - previous_y;
+    if (UsePixelScrolling()) {
+      EnqueueScroll(delta);
+    } else {
+      // Non-menu screens (including the paged log viewer) retain key navigation.
+      legacy_touch_scroll_ += delta;
+      const int height = std::max(1, MenuItemHeight());
+      while (abs(legacy_touch_scroll_) >= height) {
+        const int direction = legacy_touch_scroll_ > 0 ? 1 : -1;
+        const int key = direction > 0 ? KEY_SCROLLUP : KEY_SCROLLDOWN;
+        ProcessKey(key, 1);
+        ProcessKey(key, 0);
+        legacy_touch_scroll_ -= direction * height;
+      }
+    }
+    touch_track_ = touch_pos_;
   }
 }
 
@@ -326,7 +359,7 @@ void RecoveryUI::OnTouchRelease() {
   }
 
   // If we tracked a vertical swipe, ignore the release
-  if (touch_track_ != touch_start_) {
+  if (touch_scrolling_) {
     return;
   }
 
@@ -351,7 +384,7 @@ int RecoveryUI::OnInputEvent(int fd, uint32_t epevents) {
         break;
       case 0:
         if (IsKeyPressed(BTN_DPAD_DOWN)) ProcessKey(BTN_DPAD_DOWN, 0);
-        if (IsKeyPressed(BTN_DPAD_UP))   ProcessKey(BTN_DPAD_UP, 0);
+        if (IsKeyPressed(BTN_DPAD_UP)) ProcessKey(BTN_DPAD_UP, 0);
         break;
     }
     return 0;
@@ -376,17 +409,18 @@ int RecoveryUI::OnInputEvent(int fd, uint32_t epevents) {
   if (ev.type == EV_SYN) {
     if (touch_screen_allowed_ && ev.code == SYN_REPORT) {
       // There might be multiple SYN_REPORT events. Only report press/release once.
-      if (!touch_reported_ && touch_finger_down_) {
-        if (touch_saw_x_ && touch_saw_y_) {
-          OnTouchPress();
-          touch_reported_ = true;
-          touch_saw_x_ = touch_saw_y_ = false;
-        }
+      if (!touch_reported_ && touch_finger_down_ && touch_x_valid_ && touch_y_valid_) {
+        OnTouchPress();
+        touch_reported_ = true;
       } else if (touch_reported_ && !touch_finger_down_) {
         OnTouchRelease();
         touch_reported_ = false;
-        touch_saw_x_ = touch_saw_y_ = false;
+      } else if (touch_reported_ && (touch_saw_x_ || touch_saw_y_)) {
+        // Type-B reports only axes that changed. Vertical movement must not
+        // wait for an X update, and each complete input frame is handled once.
+        OnTouchTrack();
       }
+      touch_saw_x_ = touch_saw_y_ = false;
     }
     return 0;
   }
@@ -424,26 +458,30 @@ int RecoveryUI::OnInputEvent(int fd, uint32_t epevents) {
       case ABS_MT_POSITION_X:
         touch_finger_down_ = true;
         touch_saw_x_ = true;
-        touch_pos_.x(ev.value * gr_fb_width_real() / (touch_max_.x() - touch_min_.x()));
-        if (touch_reported_ && touch_saw_y_) {
-          OnTouchTrack();
-          touch_saw_x_ = touch_saw_y_ = false;
+        if (touch_max_.x() > touch_min_.x()) {
+          const int64_t value = std::clamp(ev.value, touch_min_.x(), touch_max_.x()) -
+                                static_cast<int64_t>(touch_min_.x());
+          touch_pos_.x(value * (gr_fb_width_real() - 1) /
+                       (static_cast<int64_t>(touch_max_.x()) - touch_min_.x()));
+          touch_x_valid_ = true;
         }
         break;
 
       case ABS_MT_POSITION_Y:
         touch_finger_down_ = true;
         touch_saw_y_ = true;
-        touch_pos_.y(ev.value * gr_fb_height_real() / (touch_max_.y() - touch_min_.y()));
-        if (touch_reported_ && touch_saw_x_) {
-          OnTouchTrack();
-          touch_saw_x_ = touch_saw_y_ = false;
+        if (touch_max_.y() > touch_min_.y()) {
+          const int64_t value = std::clamp(ev.value, touch_min_.y(), touch_max_.y()) -
+                                static_cast<int64_t>(touch_min_.y());
+          touch_pos_.y(value * (gr_fb_height_real() - 1) /
+                       (static_cast<int64_t>(touch_max_.y()) - touch_min_.y()));
+          touch_y_valid_ = true;
         }
         break;
 
       case ABS_MT_TRACKING_ID:
         // Protocol B: -1 marks lifting the contact.
-        if (ev.value < 0) touch_finger_down_ = false;
+        touch_finger_down_ = ev.value >= 0;
         break;
     }
     return 0;
@@ -561,6 +599,21 @@ void RecoveryUI::EnqueueTouch(const Point& pos) {
     event_queue[event_queue_len++] = event;
     event_queue_cond.notify_one();
   }
+}
+
+void RecoveryUI::EnqueueScroll(int delta) {
+  if (!delta) return;
+  std::lock_guard<std::mutex> lock(event_queue_mutex);
+  // Combine pending movement rather than rendering stale frames after a fast swipe.
+  if (event_queue_len && event_queue[event_queue_len - 1].type() == EventType::SCROLL) {
+    const int previous = event_queue[event_queue_len - 1].pos().y();
+    const int64_t limit = static_cast<int64_t>(gr_fb_height_real()) * 4;
+    const int movement = std::clamp(static_cast<int64_t>(previous) + delta, -limit, limit);
+    event_queue[event_queue_len - 1] = InputEvent(EventType::SCROLL, Point(0, movement));
+  } else if (event_queue_len < static_cast<int>(sizeof(event_queue) / sizeof(event_queue[0]))) {
+    event_queue[event_queue_len++] = InputEvent(EventType::SCROLL, Point(0, delta));
+  }
+  event_queue_cond.notify_one();
 }
 
 void RecoveryUI::SetScreensaverState(ScreensaverState state) {
@@ -728,18 +781,21 @@ RecoveryUI::KeyAction RecoveryUI::CheckKey(int key, bool is_long_press) {
     }
   }
 
-  // Press power seven times in a row to reboot.
-  if (key == KEY_POWER) {
-    bool reboot_enabled = enable_reboot;
+  // Synchronize the shortcut with temporary UI modes that disable reboot.
+  {
+    std::lock_guard<std::mutex> lock(key_press_mutex);
+    if (key == KEY_POWER) {
+      bool reboot_enabled = enable_reboot;
 
-    if (reboot_enabled) {
-      ++consecutive_power_keys;
-      if (consecutive_power_keys >= 7) {
-        return REBOOT;
+      if (reboot_enabled) {
+        ++consecutive_power_keys;
+        if (consecutive_power_keys >= 7) {
+          return REBOOT;
+        }
       }
+    } else {
+      consecutive_power_keys = 0;
     }
-  } else {
-    consecutive_power_keys = 0;
   }
 
   return (IsTextVisible() || screensaver_state_ == ScreensaverState::OFF) ? ENQUEUE : IGNORE;
@@ -750,4 +806,10 @@ void RecoveryUI::KeyLongPress(int) {}
 void RecoveryUI::SetEnableReboot(bool enabled) {
   std::lock_guard<std::mutex> lg(key_press_mutex);
   enable_reboot = enabled;
+  consecutive_power_keys = 0;
+}
+
+bool RecoveryUI::IsRebootEnabled() {
+  std::lock_guard<std::mutex> lock(key_press_mutex);
+  return enable_reboot;
 }

@@ -19,6 +19,7 @@
 
 #include <stdio.h>
 
+#include <algorithm>
 #include <atomic>
 #include <functional>
 #include <memory>
@@ -104,11 +105,20 @@ class Menu {
   virtual int SelectVisible(int relative_sel) = 0;
   // Scroll the menu by updown, if scrollable
   virtual int Scroll(int updown) = 0;
+  virtual bool ScrollPixels(int) {
+    return false;
+  }
+  virtual int ScrollOffset() const {
+    return 0;
+  }
   // Displays the menu headers on the screen at offset x, y
   virtual int DrawHeader(int x, int y) const = 0;
   // Iterates over the menu items and displays each of them at offset x, y.
   virtual int DrawItems(int x, int y, int screen_width, bool long_press) const = 0;
   virtual size_t ItemsCount() const = 0;
+  virtual size_t VisibleItemsCount() const {
+    return ItemsCount();
+  }
   virtual bool IsMain() const = 0;
   virtual void SetMenuHeight(int height) = 0;
 
@@ -132,9 +142,16 @@ class TextMenu : public Menu {
   int Select(int sel) override;
   int SelectVisible(int relative_sel) override;
   int Scroll(int updown) override;
+  bool ScrollPixels(int delta) override;
+  int ScrollOffset() const override {
+    return scroll_offset_;
+  }
   int DrawHeader(int x, int y) const override;
   int DrawItems(int x, int y, int screen_width, bool long_press) const override;
   size_t ItemsCount() const override;
+  size_t VisibleItemsCount() const override {
+    return std::min(ItemsCount(), max_display_items_);
+  }
 
   bool IsMain() const override {
     // Main menus have no headers
@@ -172,18 +189,31 @@ class TextMenu : public Menu {
   // The number of displayable items is only known after we started drawing the menu (to consider logo, header, etc.)
   // Make it settable after the menu is created
   void SetMenuHeight(int height) {
-    if (!calibrated_height_) {
-      max_display_items_ = height / draw_funcs_.MenuItemHeight();
-      menu_start_ = std::max(0, (int)selection_ - (int)max_display_items_ + 1);
-      calibrated_height_ = true;
+    if (height == menu_height_) return;
+    menu_height_ = height;
+    const int stride = draw_funcs_.MenuItemHeight() + draw_funcs_.MenuItemSpacing();
+    const bool initial = max_display_items_ == 0;
+    max_display_items_ = std::max(1, height / stride);
+    const size_t maximum_start =
+        ItemsCount() > max_display_items_ ? ItemsCount() - max_display_items_ : 0;
+    const size_t previous_start = menu_start_;
+    if (initial) menu_start_ = std::max(0, selection_ - static_cast<int>(max_display_items_) + 1);
+    menu_start_ = std::min(menu_start_, maximum_start);
+    // Keep the focused item visible when headers or display geometry change.
+    if (selection_ >= 0) {
+      if (static_cast<size_t>(selection_) < menu_start_)
+        menu_start_ = selection_;
+      else if (static_cast<size_t>(selection_) >= menu_start_ + max_display_items_)
+        menu_start_ = selection_ - max_display_items_ + 1;
     }
+    if (menu_start_ != previous_start || menu_start_ == maximum_start) scroll_offset_ = 0;
   }
 
  private:
   // The menu is scrollable to display more items. Used on wear devices who have smaller screens.
   const bool wrappable_;
-  // Did we compute our max height already?
-  bool calibrated_height_;
+  // Last available viewport height; recompute after a layout change.
+  int menu_height_ = -1;
   // The max number of menu items to fit vertically on a screen.
   size_t max_display_items_;
   // The length of each item to fit horizontally on a screen.
@@ -194,6 +224,7 @@ class TextMenu : public Menu {
   std::vector<std::string> text_items_;
   // The first item to display on the screen.
   size_t menu_start_;
+  int scroll_offset_ = 0;
 
   // Height in pixels of each character.
   int char_height_;
@@ -398,6 +429,7 @@ class ScreenRecoveryUI : public RecoveryUI, public DrawInterface {
   virtual int SelectMenu(int sel);
   virtual int SelectMenu(const Point& point);
   virtual int ScrollMenu(int updown);
+  int ScrollMenuPixels(int delta);
 
   // Returns the help message displayed on top of the menu.
   virtual std::vector<std::string> GetMenuHelpMessage() const;
@@ -513,6 +545,12 @@ class ScreenRecoveryUI : public RecoveryUI, public DrawInterface {
   bool show_text_ever;  // has show_text ever been true?
 
   std::vector<std::string> title_lines_;
+
+  bool UsePixelScrolling() const override {
+    return pixel_scrolling_enabled_.load();
+  }
+  std::atomic<bool> pixel_scrolling_enabled_{ false };
+  Point TranslateTouch(const Point& p) const;
 
   std::unique_ptr<Menu> menu_;
   int menu_start_y_;

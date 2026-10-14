@@ -110,19 +110,18 @@ class RecoveryUI {
     EXTRA,
     KEY,
     TOUCH,
+    SCROLL,
   };
 
   class InputEvent {
    public:
-    InputEvent() : type_(EventType::EXTRA), evt_({ 0 }) {
+    InputEvent() : type_(EventType::EXTRA), evt_(0) {
       evt_.key = static_cast<int>(KeyError::TIMED_OUT);
     }
-    explicit InputEvent(EventType type, KeyError key)
-        : type_(type), evt_({ static_cast<int>(key) }) {}
-    explicit InputEvent(int key) : type_(EventType::KEY), evt_({ key }) {}
-    explicit InputEvent(const Point& pos) : type_(EventType::TOUCH), evt_({ 0 }) {
-      evt_.pos = pos;
-    }
+    explicit InputEvent(EventType type, KeyError key) : type_(type), evt_(static_cast<int>(key)) {}
+    explicit InputEvent(int key) : type_(EventType::KEY), evt_(key) {}
+    explicit InputEvent(const Point& pos) : InputEvent(EventType::TOUCH, pos) {}
+    InputEvent(EventType type, const Point& pos) : type_(type), evt_(pos) {}
 
     EventType type() const {
       return type_;
@@ -136,9 +135,11 @@ class RecoveryUI {
 
    private:
     EventType type_;
-    union {
+    union Payload {
       int key;
       Point pos;
+      Payload(int value) : key(value) {}
+      Payload(const Point& value) : pos(value) {}
     } evt_;
   };
 
@@ -237,10 +238,16 @@ class RecoveryUI {
   // the power button 7 times in row). Call this to enable or disable that feature. It is enabled by
   // default.
   virtual void SetEnableReboot(bool enabled);
+  bool IsRebootEnabled();
 
   // --- menu display ---
 
   virtual void SetTitle(const std::vector<std::string>& lines) = 0;
+
+  // Masked credential entry. Headless implementations fail closed.
+  virtual bool RequestCredential(bool /* pin */, std::string* /* credential */) {
+    return false;
+  }
 
   // Displays a menu with the given 'headers' and 'items'. The supplied 'key_handler' callback,
   // which is typically bound to Device::HandleMenuKey(), should return the expected action for the
@@ -312,6 +319,10 @@ class RecoveryUI {
  protected:
   void EnqueueKey(int key_code);
   void EnqueueTouch(const Point& pos);
+  void EnqueueScroll(int delta);
+  virtual bool UsePixelScrolling() const {
+    return false;
+  }
 
   // The normal and dimmed brightness percentages (default: 50 and 25, which means 50% and 25% of
   // the max_brightness). Because the absolute values may vary across devices. These two values can
@@ -370,7 +381,7 @@ class RecoveryUI {
   int key_last_down;
   bool key_long_press;
   int key_down_count;
-  bool enable_reboot;
+  std::atomic<bool> enable_reboot;
 
   int rel_sum;
   int consecutive_power_keys;
@@ -396,9 +407,13 @@ class RecoveryUI {
   bool touch_saw_x_;
   bool touch_saw_y_;
   bool touch_reported_;
+  bool touch_x_valid_ = false;
+  bool touch_y_valid_ = false;
   Point touch_pos_;
   Point touch_start_;
   Point touch_track_;
+  bool touch_scrolling_ = false;
+  int legacy_touch_scroll_ = 0;
   Point touch_max_;
   Point touch_min_;
   std::vector<vkey_t> virtual_keys_;
